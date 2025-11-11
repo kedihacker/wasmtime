@@ -315,6 +315,208 @@ Wasmtime maintains safety through:
 - `tests/` - Integration tests
 - `benches/` - Performance benchmarks
 
+## Concrete Code Examples
+
+### Basic Module Execution
+
+Here's how the main types relate in a simple execution:
+
+```rust
+// 1. Create Engine - global compilation environment
+let engine = Engine::default();
+
+// 2. Compile Module - uses wasmtime-environ + wasmtime-cranelift
+let module = Module::from_file(&engine, "example.wat")?;
+
+// 3. Create Store - runtime container with user data
+let mut store = Store::new(&engine, MyState { count: 0 });
+
+// 4. Define host function - accessed via Caller
+let host_func = Func::wrap(&mut store, |mut caller: Caller<'_, MyState>| {
+    caller.data_mut().count += 1;  // Access user data
+    println!("Called from wasm!");
+});
+
+// 5. Instantiate - creates Instance with Memory, Tables, etc.
+let instance = Instance::new(&mut store, &module, &[host_func.into()])?;
+
+// 6. Get exported function - type-safe handle
+let run = instance.get_typed_func::<(i32, i32), i32>(&mut store, "add")?;
+
+// 7. Call function - executes compiled code
+let result = run.call(&mut store, (5, 7))?;
+```
+
+**Code Relations in this flow**:
+- `Engine` holds compiled `Module` (wasmtime → wasmtime-environ)
+- `Module::from_file` calls parser → environ → cranelift
+- `Store` borrows `Engine` and owns instance data
+- `Func::wrap` creates trampoline (in wasmtime/runtime/func.rs)
+- `Instance::new` uses linker logic (wasmtime/runtime/instantiate.rs)
+- `TypedFunc::call` goes through trampolines to compiled code
+
+### Linker Pattern
+
+For complex imports, use `Linker`:
+
+```rust
+let engine = Engine::default();
+let mut linker = Linker::new(&engine);
+
+// Define multiple host functions
+linker.func_wrap("env", "print", |caller: Caller<'_, ()>| {
+    println!("print called");
+})?;
+
+linker.func_wrap("env", "add", |_: Caller<'_, ()>, a: i32, b: i32| -> i32 {
+    a + b
+})?;
+
+// Instantiate with all imports at once
+let mut store = Store::new(&engine, ());
+let module = Module::from_file(&engine, "example.wat")?;
+let instance = linker.instantiate(&mut store, &module)?;
+```
+
+**Code Relations**:
+- `Linker` (wasmtime/runtime/linker.rs) stores import definitions
+- `Linker::instantiate` resolves imports and calls `Instance::new`
+- Host functions registered once, reused for multiple instances
+
+### WASI Example
+
+WASI integration shows how host interfaces work:
+
+```rust
+use wasmtime_wasi::WasiCtxBuilder;
+
+let engine = Engine::default();
+let mut linker = Linker::new(&engine);
+
+// Add all WASI functions to linker
+wasmtime_wasi::add_to_linker_sync(&mut linker)?;
+
+// Create WASI context with stdio, filesystem, etc.
+let wasi = WasiCtxBuilder::new()
+    .inherit_stdio()
+    .inherit_args()?
+    .build();
+
+let mut store = Store::new(&engine, wasi);
+let module = Module::from_file(&engine, "wasi_program.wasm")?;
+let instance = linker.instantiate(&mut store, &module)?;
+
+// Call WASI program's main
+let start = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
+start.call(&mut store, ())?;
+```
+
+**Code Relations**:
+- `wasmtime_wasi::add_to_linker_sync` registers WASI functions
+- WASI functions (in wasmtime-wasi/src/) access `WasiCtx` via `Caller`
+- `WasiCtx` uses `cap-std` for filesystem operations
+- Store's user data type implements `WasiView` trait
+
+### Component Model Example
+
+Components have parallel structure to core modules:
+
+```rust
+use wasmtime::component::*;
+
+let engine = Engine::default();
+let mut linker = Linker::new(&engine);
+
+// Add component imports
+linker.root().func_wrap("greet", |_cx, (name,): (String,)| {
+    Ok((format!("Hello, {}!", name),))
+})?;
+
+let component = Component::from_file(&engine, "component.wasm")?;
+let mut store = Store::new(&engine, ());
+let instance = linker.instantiate(&mut store, &component)?;
+
+// Call component function
+let func = instance.get_typed_func::<(String,), (String,)>(&mut store, "run")?;
+let (result,) = func.call(&mut store, ("World".to_string(),))?;
+```
+
+**Code Relations**:
+- `component::Component` parallels `Module`
+- `component::Linker` handles interface resolution
+- Component code in wasmtime/src/runtime/component/
+- Uses same `Engine` and `Store` as core wasm
+
+### Compiler Abstraction Example
+
+Switching compilers (internal architecture):
+
+```rust
+// In wasmtime-cranelift/src/compiler.rs:
+impl wasmtime_environ::Compiler for Compiler {
+    fn compile_function(
+        &self,
+        translation: &ModuleTranslation,
+        index: DefinedFuncIndex,
+        data: FunctionBodyData,
+        tunables: &Tunables,
+    ) -> Result<CompiledFunction> {
+        // Use Cranelift to compile function
+        let func = translate_wasm_function(data, ...)?;
+        let code = cranelift_codegen::compile(&func, ...)?;
+        Ok(CompiledFunction { code, ... })
+    }
+}
+
+// In wasmtime/src/compile.rs:
+// Engine selects compiler based on Config
+let compiler: Box<dyn Compiler> = if config.use_cranelift {
+    Box::new(wasmtime_cranelift::builder())
+} else {
+    Box::new(wasmtime_winch::builder())
+};
+```
+
+**Code Relations**:
+- `Compiler` trait in wasmtime-environ defines interface
+- wasmtime-cranelift and wasmtime-winch implement it
+- `Engine` holds the compiler implementation
+- `Module::new` calls `compiler.compile_function()` for each function
+
+### Async Execution Example
+
+Async shows Store's flexibility:
+
+```rust
+let mut config = Config::new();
+config.async_support(true);
+let engine = Engine::new(&config)?;
+
+let module = Module::from_file(&engine, "async.wasm")?;
+let mut store = Store::new(&engine, ());
+
+// Host async function
+let func = Func::wrap_async(
+    &mut store,
+    |_caller, param: i32| Box::new(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        Ok(param * 2)
+    })
+);
+
+let instance = Instance::new(&mut store, &module, &[func.into()])?;
+let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
+
+// Async call
+run.call_async(&mut store, ()).await?;
+```
+
+**Code Relations**:
+- Config enables async support (uses wasmtime-fiber for stack switching)
+- `Func::wrap_async` creates async trampolines
+- `call_async` returns Future that yields to executor
+- Fiber implementation in wasmtime/crates/fiber/
+
 ## Summary
 
 The key to understanding Wasmtime's code relations:
