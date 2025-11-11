@@ -51,6 +51,7 @@
   - [Vulnerability runbook](./security-vulnerability-runbook.md)
 - [Contributing](contributing.md)
   - [Architecture](./contributing-architecture.md)
+  - [Code Relations](./code-relations.md)
   - [Building](./contributing-building.md)
   - [Testing](./contributing-testing.md)
   - [Fuzzing](./contributing-fuzzing.md)
